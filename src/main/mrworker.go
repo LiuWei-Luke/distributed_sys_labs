@@ -10,7 +10,9 @@ package main
 // Please do not change this file.
 //
 
-import "mr"
+import (
+	"mr"
+)
 import "plugin"
 import "os"
 import "fmt"
@@ -23,7 +25,17 @@ func main() {
 	}
 
 	mapf, reducef := loadPluginn(os.Args[1])
-
+	//due unix signal
+	//sig := make(chan os.Signal, 1)
+	//done := make(chan bool, 1)
+	//signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	//go func() {
+	//	<-done
+	//	fmt.Printf("Receice sigterm.")
+	//	done <- true
+	//}()
+	//
+	//<-done
 	mr.Worker(mapf, reducef)
 }
 
