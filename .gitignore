@@ -1,3 +1,7 @@
 pkg/
 api.key
 *-handin.tar.gz
+*.iml
+src/main/mr-temp/
+src/main/mr-tmp/
+.idea/

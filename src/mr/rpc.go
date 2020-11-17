@@ -24,6 +24,22 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type TaskWorker struct {
+	FileName string
+	TaskNo int
+	NReduce int
+	IsMapTask bool
+	IsReduceTask bool
+	ReceiveTimestamp int64
+}
+
+func (task *TaskWorker) equals(task1 *TaskWorker) bool {
+	sameFile := task1.FileName == task.FileName
+	sameNo := task1.TaskNo == task.TaskNo
+	sameType := task1.IsMapTask == task.IsMapTask
+	return sameFile && sameNo && sameType
+}
+
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
