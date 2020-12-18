@@ -396,25 +396,29 @@ func (rf *Raft) FollowerCountDown() {
 	}
 }
 
-// after seconds if candidate haven't been leader, turn to follower
 func (rf *Raft) CandidateCountDown() {
-	idBefore := CreateCaptcha()
-	rf.candidateTimerUUID = idBefore
+	//idBefore := CreateCaptcha()
+	//rf.candidateTimerUUID = idBefore
 	_, _ = DPrintf("Rafe %d-%s-%d: Start candidate count down.", rf.me, rf.status, rf.currentTerm)
 	countDown := randomACountDown()
 	time.Sleep(time.Duration(countDown) * time.Millisecond)
 
-	idAfter := rf.followerTimerUUID
-	validTimer := idBefore == idAfter
-	if !validTimer {
-		_, _ = DPrintf("Rafe %d-%s-%d: candidate timer has been instead, deprecate it.", rf.me, rf.status, rf.currentTerm)
-		return
-	}
+	//idAfter := rf.followerTimerUUID
+	//validTimer := idBefore == idAfter
+	//if !validTimer {
+	//	_, _ = DPrintf("Rafe %d-%s-%d: candidate timer has been instead, deprecate it.", rf.me, rf.status, rf.currentTerm)
+	//	return
+	//}
 
 	// reset vote
 	rf.mu.Lock()
 	status := rf.status
 	rf.mu.Unlock()
+
+	if status == "Leader" {
+		_, _ = DPrintf("Rafe %d-%s-%d: Now i'm a Leader.", rf.me, rf.status, rf.currentTerm)
+		return
+	}
 
 	if status == "Follower" {
 		_, _ = DPrintf("Rafe %d-%s-%d: Now i'm a follower.", rf.me, rf.status, rf.currentTerm)
@@ -448,6 +452,7 @@ func (rf *Raft) LeaderHeartbeatPeriodically() {
 		isLeader := rf.status == "Leader"
 		rf.mu.Unlock()
 		if !isLeader {
+			_, _ = DPrintf("Rafe %d-%s-%d: I'm no longer leader!.", rf.me, rf.status, rf.currentTerm)
 			break
 		}
 
@@ -460,16 +465,7 @@ func (rf *Raft) LeaderHeartbeatPeriodically() {
 	}
 }
 
-// heartbeat check
-func (rf *Raft) ifTimeOutAfterLastHeartbeat(duration int, lastReceiveAt int64) bool {
-	//_, _ = DPrintf("Rafe %d-%d: %d", rf.me, rf.status, duration)
-	_, _ = DPrintf("Now time {%d} -- Rafe %d-%d: timeout checkout (%d) (%d)",
-		GetMillsSecond() , rf.me, rf.status, GetMillsSecond() - int64(duration), lastReceiveAt)
-	return GetMillsSecond() - int64(duration) > lastReceiveAt
-}
-
 // candidate part
-
 func (rf *Raft) turnStateToCandidate() {
 	_, _ = DPrintf("Rafe %d-%s-%d: I'm becoming a candidate!.", rf.me, rf.status, rf.currentTerm)
 
@@ -553,18 +549,22 @@ func (rf *Raft) CheckIfEnoughVote()  {
 
 // leader state
 func (rf *Raft) TurnToLeader() {
-	_, _ = DPrintf("Raft %d-%s-%d: I'm becoming a leader!.", rf.me, rf.status, rf.currentTerm)
+	statusBefore := ""
 
 	rf.mu.Lock()
-
-	rf.status = "Leader"
-	rf.voteBucket = []int {}
-	rf.votedFor = -1
-
+	statusBefore = rf.status
+	if rf.status == "Candidate" {
+		rf.status = "Leader"
+		rf.voteBucket = []int {}
+		rf.votedFor = -1
+	}
 	rf.mu.Unlock()
 
 	// send heartbeat
-	go rf.LeaderHeartbeatPeriodically()
+	if statusBefore == "Candidate" {
+		_, _ = DPrintf("Raft %d-%s-%d: I'm becoming a leader!.", rf.me, rf.status, rf.currentTerm)
+		go rf.LeaderHeartbeatPeriodically()
+	}
 }
 
 //
