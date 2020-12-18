@@ -448,9 +448,7 @@ func (rf *Raft) LeaderHeartbeatPeriodically() {
 		time.Sleep(time.Duration(countDown) * time.Millisecond)
 
 		// if not leader, stop leader heartbeat send
-		rf.mu.Lock()
 		isLeader := rf.status == "Leader"
-		rf.mu.Unlock()
 		if !isLeader {
 			_, _ = DPrintf("Rafe %d-%s-%d: I'm no longer leader!.", rf.me, rf.status, rf.currentTerm)
 			break
