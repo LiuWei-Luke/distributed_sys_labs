@@ -17,9 +17,16 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+)
 import "sync/atomic"
-import "../labrpc"
+import (
+	"labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
@@ -37,7 +44,7 @@ import "../labrpc"
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
-type ApplyMsg struct {
+type 	ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
@@ -56,17 +63,35 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	status    string                 // follower,candidate, leader
+	receiveAt int64         // unix time if receive a hear beat
+	// Persistent state on all servers:
+	currentTerm int 			 // latest term server has seen
+	votedFor    int           // candidateId for this term
+	log         []LogEntry           //
+	// Volatile state on all servers:
+	commitIndex int             // index of highest log entry known to be committed
+	lastApplied  int            // index of highest log entry applied to state machine
+	// Volatile state on leaders:
+	nextIndex[]  int           // for each server, index of the next log entry to send to that server
+	matchIndex[] int 		   // for each server, index of highest log entry known to be replicated on server
+	// vote buckets
+	voteBucket[] int          // save voter
 
+	// timer uuid
+	followerTimerUUID string
+	candidateTimerUUID string
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	term := rf.currentTerm
+	status := rf.status
+	rf.mu.Unlock()
+	return term, status == "Leader"
 }
 
 //
@@ -110,13 +135,16 @@ func (rf *Raft) readPersist(data []byte) {
 
 
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int             // candidate term
+	CandidateId  int        // candidate's id
+	LastLogIndex int           // index of candidate’s last log entry
+	LastLogTerm  int           // term of candidate’s last log entry
 }
 
 //
@@ -125,6 +153,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term       int            // currentTerm, for candidate to update itself
+	VoteGranted bool          // true if vote for this candidate
 }
 
 //
@@ -132,6 +162,45 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	// safety unlock
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+
+	// term check
+	if args.Term < rf.currentTerm {
+		_, _ = DPrintf("Raft %d-%s: Candidate term {%d} is smaller than current term {%d}", rf.me, rf.status, args.Term, rf.currentTerm)
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		go rf.TurnToFollower()
+		return
+	}
+
+	if rf.currentTerm == args.Term && rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		_, _ = DPrintf("Raft %d-%s-%d: has voted for %d, candidate %d is loser.",
+			rf.me, rf.status, rf.currentTerm, rf.votedFor, args.CandidateId)
+		reply.VoteGranted = false
+		return
+	}
+
+
+	//If votedFor is null or candidateId, and candidate’s log is at
+	//least as up-to-date as receiver’s log, grant vote
+		if args.LastLogIndex >= rf.lastApplied {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+			if rf.currentTerm < args.Term {
+				rf.currentTerm = args.Term
+				reply.Term = rf.currentTerm
+				go rf.TurnToFollower()
+			}
+			return
+		} else {
+			_, _ = DPrintf("Raft %d-%s: candidate's log index {%d} are not as up-to-date as mine {%d}",
+				rf.me, rf.status, args.LastLogIndex, rf.lastApplied)
+			return
+		}
 }
 
 //
@@ -168,6 +237,101 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// log entry
+type LogEntry struct {
+
+}
+
+// append entries
+type AppendEntriesArgs struct {
+	Term          int     //leader's term
+	LeaderId      int	   //follower can redirect client
+	PrevLogIndex  int  //index of log entry immediately preceding new ones
+	PrevLogTerm   int    //term of prevLogIndex entry
+	Entries       []*LogEntry // log entries to store, empty for heartbeat; send mor than one for efficiency
+	LeaderCommit  int    // leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term     int // currentTerm, for leader to update itself
+	Success  bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+}
+
+// AppendEntry RPC handler
+func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
+	if rf.currentTerm > args.Term {
+		_, _ = DPrintf("Raft %d-%s: append entry: Leader %d term {%d} is less than mine: {%d}.", rf.me, rf.status, args.LeaderId, args.Term, rf.currentTerm)
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	// 2A heartbeat
+	if len(args.Entries) == 0 {
+		rf.heartBeatHandler(args)
+		reply.Success = true
+		return
+	}
+}
+
+func (rf *Raft) heartBeatHandler(args *AppendEntriesArgs) {
+	_, _ = DPrintf("Raft %d-%s-%d: receive heartbeat from leader: %d.", rf.me, rf.status,rf.currentTerm, args.LeaderId)
+	// term check
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.status = "Follower"
+		rf.TurnToFollower()
+		return
+	}
+
+	// candidate to follower
+	if rf.status == "Candidate" {
+		rf.status = "Follower"
+		rf.TurnToFollower()
+		return
+	}
+
+	// just rest timeout
+	go rf.FollowerCountDown()
+}
+
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+	return ok
+}
+
+// use to send entry to follower
+func (rf *Raft) SendHeartbeat(index int) {
+	args := AppendEntriesArgs{
+		Term: rf.currentTerm,
+		LeaderId: rf.me,
+		PrevLogTerm: 0,
+		PrevLogIndex: 0,
+		Entries: []*LogEntry{},
+		LeaderCommit: 0,
+	}
+
+	reply := AppendEntriesReply{
+		Term:    0,
+		Success: false,
+	}
+
+	ok := rf.sendAppendEntry(index, &args, &reply)
+
+	if !ok {
+		_, _ = DPrintf("Raft %d-%s-%d: peer: %d refused my heartbeat.", rf.me, rf.status, rf.currentTerm, index)
+	} else  {
+		_, _ = DPrintf("Raft %d-%s-%d: peer: %d response my heartbeat.", rf.me, rf.status, rf.currentTerm, index)
+		rf.mu.Lock()
+		if rf.currentTerm < reply.Term {
+			rf.currentTerm = reply.Term
+			go rf.TurnToFollower()
+		}
+		rf.mu.Unlock()
+	}
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -194,6 +358,215 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+// if term in rpc req > currentTerm, turn to follower
+func (rf *Raft) TurnToFollower() {
+	rf.mu.Lock()
+	rf.status = "Follower"
+	rf.votedFor = -1
+	rf.mu.Unlock()
+	go rf.FollowerCountDown()
+}
+
+func (rf *Raft) FollowerCountDown() {
+	idBefore := CreateCaptcha()
+	rf.followerTimerUUID = idBefore
+	_, _ = DPrintf("Rafe %d-%s-%d: timer id: %s Timer before sleep %s", rf.me, rf.status, rf.currentTerm, idBefore, rf.followerTimerUUID)
+	countDown := randomACountDown()
+	time.Sleep(time.Duration(countDown) * time.Millisecond)
+
+	idAfter := rf.followerTimerUUID
+
+	_, _ = DPrintf("Rafe %d-%s-%d: timer id: %s Timer after sleep %s", rf.me, rf.status, rf.currentTerm, idBefore ,rf.followerTimerUUID)
+	validTimer := idBefore == idAfter
+
+	if !validTimer {
+		_, _ = DPrintf("Rafe %d-%s-%d: follower timer has been instead, deprecate it.", rf.me, rf.status, rf.currentTerm)
+		return
+	}
+
+	if rf.status != "Follower" {
+		_, _ = DPrintf("Rafe %d-%s-%d: I'm not follower now, deprecate timeout.", rf.me, rf.status, rf.currentTerm)
+		return
+	}
+
+	// turn to candidate
+	if rf.status == "Follower" {
+		_, _ = DPrintf("Rafe %d-%s-%d: valid follower Timer!!", rf.me, rf.status, rf.currentTerm)
+		rf.turnStateToCandidate()
+	}
+}
+
+// after seconds if candidate haven't been leader, turn to follower
+func (rf *Raft) CandidateCountDown() {
+	idBefore := CreateCaptcha()
+	rf.candidateTimerUUID = idBefore
+	_, _ = DPrintf("Rafe %d-%s-%d: Start candidate count down.", rf.me, rf.status, rf.currentTerm)
+	countDown := randomACountDown()
+	time.Sleep(time.Duration(countDown) * time.Millisecond)
+
+	idAfter := rf.followerTimerUUID
+	validTimer := idBefore == idAfter
+	if !validTimer {
+		_, _ = DPrintf("Rafe %d-%s-%d: candidate timer has been instead, deprecate it.", rf.me, rf.status, rf.currentTerm)
+		return
+	}
+
+	// reset vote
+	rf.mu.Lock()
+	status := rf.status
+	rf.mu.Unlock()
+
+	if status == "Follower" {
+		_, _ = DPrintf("Rafe %d-%s-%d: Now i'm a follower.", rf.me, rf.status, rf.currentTerm)
+		return
+	}
+
+	if status == "Candidate" {
+		_, _ = DPrintf("Rafe %d-%s-%d: start a new term for candidate.", rf.me, rf.status, rf.currentTerm)
+		rf.voteBucket = []int {}
+		rf.votedFor = -1
+		go rf.turnStateToCandidate()
+	}
+
+}
+
+// periodically sent heart beat
+func (rf *Raft) LeaderHeartbeatPeriodically() {
+	// send heartbeat
+	for index, _ := range rf.peers {
+		if rf.me != index {
+			go rf.SendHeartbeat(index)
+		}
+	}
+
+	for {
+		countDown := heartBeatDuration()
+		time.Sleep(time.Duration(countDown) * time.Millisecond)
+
+		// if not leader, stop leader heartbeat send
+		rf.mu.Lock()
+		isLeader := rf.status == "Leader"
+		rf.mu.Unlock()
+		if !isLeader {
+			break
+		}
+
+		// send heartbeat
+		for index, _ := range rf.peers {
+			if rf.me != index {
+				go rf.SendHeartbeat(index)
+			}
+		}
+	}
+}
+
+// heartbeat check
+func (rf *Raft) ifTimeOutAfterLastHeartbeat(duration int, lastReceiveAt int64) bool {
+	//_, _ = DPrintf("Rafe %d-%d: %d", rf.me, rf.status, duration)
+	_, _ = DPrintf("Now time {%d} -- Rafe %d-%d: timeout checkout (%d) (%d)",
+		GetMillsSecond() , rf.me, rf.status, GetMillsSecond() - int64(duration), lastReceiveAt)
+	return GetMillsSecond() - int64(duration) > lastReceiveAt
+}
+
+// candidate part
+
+func (rf *Raft) turnStateToCandidate() {
+	_, _ = DPrintf("Rafe %d-%s-%d: I'm becoming a candidate!.", rf.me, rf.status, rf.currentTerm)
+
+	rf.followerTimerUUID = ""
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm += 1
+	rf.status = "Candidate"
+	rf.voteBucket = []int {}
+	rf.votedFor = -1
+
+	go rf.CandidateCountDown()
+	// send request vote
+	rf.parallelRequestVote()
+
+}
+
+func (rf *Raft) parallelRequestVote() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			rf.votedFor = i
+		} else {
+			go rf.RequestForVote(i)
+		}
+	}
+}
+
+func (rf *Raft) RequestForVote(index int) {
+	args := RequestVoteArgs {
+		rf.currentTerm,
+		rf.me,
+		rf.lastApplied,
+		0,
+	}
+
+	reply := RequestVoteReply{}
+
+	rf.sendRequestVote(index, &args, &reply)
+
+	rf.mu.Lock()
+	thisTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	if thisTerm < reply.Term {
+		_, _ = DPrintf("Rafe %d-%s-%d : peer %d term %d is larger than mine %d ! become follower",
+			rf.me, rf.status, rf.currentTerm, index, reply.Term, thisTerm,
+		)
+		rf.mu.Lock()
+		rf.currentTerm = reply.Term
+		rf.mu.Unlock()
+		rf.TurnToFollower()
+		return
+	}
+
+	if reply.VoteGranted {
+		// handle res
+		_, _ = DPrintf("Rafe %d-%s-%d : peer %d grant me!", rf.me, rf.status, rf.currentTerm, index)
+
+		if reply.Term < rf.currentTerm {
+			_, _ = DPrintf("Rafe %d-%s-%d : peer %d vote's term %d is older than mine %d ! invalid vote",
+				rf.me, rf.status, rf.currentTerm, index, reply.Term, rf.currentTerm,
+			)
+			return
+		}
+
+		rf.voteBucket = append(rf.voteBucket, index)
+		rf.CheckIfEnoughVote()
+	} else {
+		_, _ = DPrintf("Raft %d-%s-%d : peer %d refused my vote req.", rf.me, rf.status, rf.currentTerm, index)
+	}
+
+}
+
+func (rf *Raft) CheckIfEnoughVote()  {
+	voteCount := len(rf.voteBucket)
+	if voteCount >= len(rf.peers)/ 2 {
+		rf.TurnToLeader()
+	}
+}
+
+// leader state
+func (rf *Raft) TurnToLeader() {
+	_, _ = DPrintf("Raft %d-%s-%d: I'm becoming a leader!.", rf.me, rf.status, rf.currentTerm)
+
+	rf.mu.Lock()
+
+	rf.status = "Leader"
+	rf.voteBucket = []int {}
+	rf.votedFor = -1
+
+	rf.mu.Unlock()
+
+	// send heartbeat
+	go rf.LeaderHeartbeatPeriodically()
+}
+
 //
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
@@ -208,6 +581,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	_, _ = DPrintf("Raft %d-%s-%d : I'm dead!!!", rf.me, rf.status, rf.currentTerm)
 }
 
 func (rf *Raft) killed() bool {
@@ -232,12 +606,37 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.votedFor = -1
+	rf.status = "Follower"
+	rf.followerTimerUUID = ""
+
+	_, _ = DPrintf("Raft %d-%s : I'm starting", rf.me, rf.status)
 
 	// Your initialization code here (2A, 2B, 2C).
+	go rf.FollowerCountDown()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 
 	return rf
+}
+
+func GetMillsSecond() int64 {
+	return time.Now().UnixNano() / 1e6
+}
+
+
+func CreateCaptcha() string {
+	return fmt.Sprintf("%06v", rand.New(rand.NewSource(time.Now().UnixNano())).Int31n(1000000))
+}
+
+func randomACountDown() int {
+	countDown := rand.Intn(250) + 300
+	return countDown
+}
+
+func heartBeatDuration() int {
+	countDown := rand.Intn(80) + 100
+	return countDown
 }
